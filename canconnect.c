@@ -114,6 +114,7 @@ static void* print( void* s ) {
       if ( frame.can_id & CAN_EFF_FLAG )
         view |= CANLIB_VIEW_INDENT_SFF;
       /* print CAN frame in log file style to stdout */
+      gettimeofday( &tv, NULL );
       printf( "(%010ld.%06ld) ", tv.tv_sec, tv.tv_usec );
       printf( "%*s ", 10, ifname );
       fprint_canframe( stdout, &frame, "\n", 0, CAN_MTU );
