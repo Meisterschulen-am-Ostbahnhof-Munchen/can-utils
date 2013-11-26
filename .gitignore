@@ -25,6 +25,7 @@ GNUmakefile.in
 /bcmserver
 /can-calc-bit-timing
 /canbusload
+/canconnect
 /candump
 /canfdtest
 /cangen
