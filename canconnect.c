@@ -146,6 +146,11 @@ int main( int argc, char **argv ) {
     }
   }
 
+  if( argc - optind <= 0 ) {
+    print_usage( basename( argv[0] ) );
+    return 1;
+  }
+
   devname = argc - optind; /* find real number of user assignments */
 
   /* open socket */
