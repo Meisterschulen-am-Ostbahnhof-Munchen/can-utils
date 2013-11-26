@@ -1,5 +1,5 @@
 /*
- * canconnect.c - replay a compact CAN frame logfile to CAN devices
+ * canconnect.c - connect canif with stdin and stdout
  *
  * Copyright (c) 2002-2007 Volkswagen Group Electronic Research
  * All rights reserved.
@@ -47,6 +47,7 @@
 #include <libgen.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <pthread.h>
 
 #include <net/if.h>
 #include <sys/socket.h>
@@ -57,152 +58,198 @@
 
 #include "lib.h"
 
-#define CHANNELS	20	/* anyone using more than 20 CAN interfaces at a time? */
 #define COMMENTSZ 200
 #define BUFSZ (sizeof("(1345212884.318850)") + IFNAMSIZ + 4 + CL_CFSZ + COMMENTSZ) /* for one line in the logfile */
-#define STDOUTIDX	65536	/* interface index for printing on stdout - bigger than max uint16 */
-
-const int canfd_on = 1;
 
 extern int optind;
+int txidx;
+char* ifname;
 
-void print_usage(char *prg)
-{
-	fprintf(stderr, "\nUsage: %s [interface]\n\n", prg);
+void print_usage( char *prg ) {
+  fprintf( stderr, "\nUsage: %s [interface]\n\n", prg );
 }
 
 
-int main(int argc, char **argv)
-{
-	static char buf[BUFSZ], device[BUFSZ], ascframe[BUFSZ];
-	struct sockaddr_can addr;
-	static struct canfd_frame frame;
-	static struct timeval today_tv, log_tv;
-	int s; /* CAN_RAW socket */
-	FILE *infile = stdin;
-	static int opt;
-	int txidx;       /* sendto() interface index */
-	int eof, txmtu, devname;
-	char *fret;
-	struct ifreq ifr;
+static void* print( void* s ) {
+  struct msghdr msg;
+  char ctrlmsg[CMSG_SPACE( sizeof( struct timeval ) ) + CMSG_SPACE( sizeof( __u32 ) )];
+  struct iovec iov;
+  struct canfd_frame frame;
+  struct sockaddr_can addr;
+  struct timeval tv;
+  fd_set rdfs;
+  int ret, nbytes;
+  int skt = *( ( int* )s );
+  unsigned char view = 0;
 
-	while ((opt = getopt(argc, argv, "?")) != -1) {
-		switch (opt) {
-		case '?':
-		default:
-			print_usage(basename(argv[0]));
-			return 1;
-			break;
-		}
-	}
+  iov.iov_base = &frame;
+  msg.msg_name = &addr;
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+  msg.msg_control = &ctrlmsg;
 
-	devname = argc - optind; /* find real number of user assignments */
+  addr.can_family = AF_CAN;
+  addr.can_ifindex = txidx;
 
-	/* open socket */
-	if ((s = socket(PF_CAN, SOCK_RAW, CAN_RAW)) < 0) {
-		perror("socket");
-		return 1;
-	}
+  for( ;; ) {
+    FD_ZERO( &rdfs );
+    FD_SET( skt, &rdfs );
+    if ( ( ret = select( skt+1, &rdfs, NULL, NULL, NULL ) ) <= 0 ) {
+      continue;
+    }
 
-	addr.can_family = AF_CAN;
-	strcpy(ifr.ifr_name, argv[devname]);
-	if (ioctl(s, SIOCGIFINDEX, &ifr) < 0)
-		perror("SIOCGIFINDEX");
-	txidx = ifr.ifr_ifindex;
-	addr.can_ifindex = ifr.ifr_ifindex;
+    if ( FD_ISSET( skt, &rdfs ) ) {
+      iov.iov_len = sizeof( frame );
+      msg.msg_namelen = sizeof( addr );
+      msg.msg_controllen = sizeof( ctrlmsg );
+      msg.msg_flags = 0;
 
+      nbytes = recvmsg( skt, &msg, 0 );
+      if ( nbytes < 0 ) {
+        perror( "read" );
+        return NULL;
+      }
 
-	/* disable unneeded default receive filter on this RAW socket */
-	setsockopt(s, SOL_CAN_RAW, CAN_RAW_FILTER, NULL, 0);
+      /* once we detected a EFF frame indent SFF frames accordingly */
+      if ( frame.can_id & CAN_EFF_FLAG )
+        view |= CANLIB_VIEW_INDENT_SFF;
+      /* print CAN frame in log file style to stdout */
+      printf( "(%010ld.%06ld) ", tv.tv_sec, tv.tv_usec );
+      printf( "%*s ", 10, ifname );
+      fprint_canframe( stdout, &frame, "\n", 0, CAN_MTU );
+      fflush( stdout );
+    }
+  }
+  return NULL;
+}
 
-	/* try to switch the socket into CAN FD mode */
-	setsockopt(s, SOL_CAN_RAW, CAN_RAW_FD_FRAMES, &canfd_on, sizeof(canfd_on));
+int main( int argc, char **argv ) {
+  static char buf[BUFSZ], device[BUFSZ], ascframe[BUFSZ];
+  struct sockaddr_can addr;
+  static struct canfd_frame frame;
+  static struct timeval today_tv, log_tv;
+  int s; /* CAN_RAW socket */
+  FILE *infile = stdin;
+  static int opt;
+  int eof, txmtu, devname;
+  char *fret;
+  struct ifreq ifr;
+  pthread_t prt;
 
-	if (bind(s, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-		perror("bind");
-		return 1;
-	}
+  while ( ( opt = getopt( argc, argv, "?" ) ) != -1 ) {
+    switch ( opt ) {
+      case '?':
+      default:
+        print_usage( basename( argv[0] ) );
+        return 1;
+        break;
+    }
+  }
 
+  devname = argc - optind; /* find real number of user assignments */
 
-	while ( 1 ) {
+  /* open socket */
+  if ( ( s = socket( PF_CAN, SOCK_RAW, CAN_RAW ) ) < 0 ) {
+    perror( "socket" );
+    return 1;
+  }
 
-		/* read first non-comment frame from logfile */
-		while ((fret = fgets(buf, BUFSZ-1, infile)) != NULL && buf[0] != '(') {
-			if (strlen(buf) >= BUFSZ-2) {
-				fprintf(stderr, "comment line too long for input buffer\n");
-				return 1;
-			}
-		}
+  ifname = argv[devname];
 
-		if (!fret)
-			goto out; /* nothing to read */
-
-		eof = 0;
-
-		if (sscanf(buf, "(%ld.%ld) %s %s", &log_tv.tv_sec, &log_tv.tv_usec,
-			   device, ascframe) != 4) {
-			fprintf(stderr, "incorrect line format in logfile\n");
-			return 1;
-		}
-
-
-		while (!eof) {
-
-		  	for( ;; ) {
-
-				if (strlen(device) >= IFNAMSIZ) {
-					fprintf(stderr, "log interface name '%s' too long!", device);
-					return 1;
-				}
-
-
-
-				txmtu = parse_canframe(ascframe, &frame);
-				if (!txmtu) {
-					fprintf(stderr, "wrong CAN frame format: '%s'!", ascframe);
-					return 1;
-				}
-
-				addr.can_family  = AF_CAN;
-				addr.can_ifindex = txidx; /* send via this interface */
-
-				if (sendto(s, &frame, txmtu, 0,	(struct sockaddr*)&addr, sizeof(addr)) != txmtu) {
-					perror("sendto");
-					return 1;
-				}
+  addr.can_family = AF_CAN;
+  strcpy( ifr.ifr_name, argv[devname] );
+  if ( ioctl( s, SIOCGIFINDEX, &ifr ) < 0 ) perror( "SIOCGIFINDEX" );
+  txidx = ifr.ifr_ifindex;
+  addr.can_ifindex = ifr.ifr_ifindex;
 
 
-				/* read next non-comment frame from logfile */
-				while ((fret = fgets(buf, BUFSZ-1, infile)) != NULL && buf[0] != '(') {
-					if (strlen(buf) >= BUFSZ-2) {
-						fprintf(stderr, "comment line too long for input buffer\n");
-						return 1;
-					}
-				}
-
-				if (!fret) {
-					eof = 1; /* this file is completely processed */
-					break;
-				}
-
-				if (sscanf(buf, "(%ld.%ld) %s %s", &log_tv.tv_sec, &log_tv.tv_usec,
-					   device, ascframe) != 4) {
-					fprintf(stderr, "incorrect line format in logfile\n");
-					return 1;
-				}
-
-			}
+  if ( bind( s, ( struct sockaddr * )&addr, sizeof( addr ) ) < 0 ) {
+    perror( "bind" );
+    return 1;
+  }
 
 
-			gettimeofday(&today_tv, NULL);
+  pthread_create( &prt, NULL, print, &s );
 
-		} /* while (!eof) */
+  for( ;; ) {
 
-	} /* while */
+    /* read first non-comment frame from logfile */
+    while ( ( fret = fgets( buf, BUFSZ-1, infile ) ) != NULL && buf[0] != '(' ) {
+      if ( strlen( buf ) >= BUFSZ-2 ) {
+        fprintf( stderr, "comment line too long for input buffer\n" );
+        return 1;
+      }
+    }
+
+    if ( !fret )
+      goto out; /* nothing to read */
+
+    eof = 0;
+
+    if ( sscanf( buf, "(%ld.%ld) %s %s", &log_tv.tv_sec, &log_tv.tv_usec,
+                 device, ascframe ) != 4 ) {
+      fprintf( stderr, "incorrect line format in logfile\n" );
+      return 1;
+    }
+
+
+    while ( !eof ) {
+
+      for( ;; ) {
+
+        if ( strlen( device ) >= IFNAMSIZ ) {
+          fprintf( stderr, "log interface name '%s' too long!", device );
+          return 1;
+        }
+
+
+
+        txmtu = parse_canframe( ascframe, &frame );
+        if ( !txmtu ) {
+          fprintf( stderr, "wrong CAN frame format: '%s'!", ascframe );
+          return 1;
+        }
+
+        addr.can_family  = AF_CAN;
+        addr.can_ifindex = txidx; /* send via this interface */
+
+        if ( sendto( s, &frame, txmtu, 0,	( struct sockaddr* )&addr, sizeof( addr ) ) != txmtu ) {
+          perror( "sendto" );
+          return 1;
+        }
+
+
+        /* read next non-comment frame from logfile */
+        while ( ( fret = fgets( buf, BUFSZ-1, infile ) ) != NULL && buf[0] != '(' ) {
+          if ( strlen( buf ) >= BUFSZ-2 ) {
+            fprintf( stderr, "comment line too long for input buffer\n" );
+            return 1;
+          }
+        }
+
+        if ( !fret ) {
+          eof = 1; /* this file is completely processed */
+          break;
+        }
+
+        if ( sscanf( buf, "(%ld.%ld) %s %s", &log_tv.tv_sec, &log_tv.tv_usec,
+                     device, ascframe ) != 4 ) {
+          fprintf( stderr, "incorrect line format in logfile\n" );
+          return 1;
+        }
+
+      }
+
+
+      gettimeofday( &today_tv, NULL );
+
+    }
+
+  }
 
 out:
 
-	close(s);
-	fclose(infile);
-	return 0;
+  close( s );
+  fclose( infile );
+  return 0;
 }
