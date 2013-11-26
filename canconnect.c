@@ -257,5 +257,6 @@ out:
 
   close( s );
   fclose( infile );
+  pthread_join( prt, NULL );
   return 0;
 }
