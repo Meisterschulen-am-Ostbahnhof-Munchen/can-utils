@@ -254,9 +254,9 @@ int main( int argc, char **argv ) {
   }
 
 out:
-
   close( s );
   fclose( infile );
+  pthread_cancel( prt );
   pthread_join( prt, NULL );
   return 0;
 }
