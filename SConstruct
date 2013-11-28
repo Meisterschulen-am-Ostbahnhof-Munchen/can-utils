@@ -28,6 +28,7 @@ l = Library( 'canutils', [ 'lib.c' ], CFLAGS=[ '-Iinclude' ] )
 
 for b in bins:
   p = Program( b, [ b + '.c' ], LIBS=['pthread', 'canutils' ], CFLAGS=[ '-Iinclude' ], LINKFLAGS=['-L.'] )
+  Install('/usr/local/bin', b )
   Depends( p, l )
 
 
