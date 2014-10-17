@@ -1,3 +1,5 @@
+# invoke "scons install" to build and install all programs 
+
 bins = [
   'asc2log', 
   'bcmserver', 
@@ -26,9 +28,12 @@ bins = [
 
 l = Library( 'canutils', [ 'lib.c' ], CFLAGS=[ '-Iinclude' ] )
 
+env = Environment()
+
 for b in bins:
   p = Program( b, [ b + '.c' ], LIBS=['pthread', 'canutils' ], CFLAGS=[ '-Iinclude' ], LINKFLAGS=['-L.'] )
-  Install('/usr/local/bin', b )
   Depends( p, l )
+  env.Install('/usr/local/bin', p )
+  env.Alias('install', '/usr/local/bin')
 
 
